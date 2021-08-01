@@ -1,57 +1,78 @@
 #!/usr/bin/env python3
 import sys
 import time
+import jenkins
+import json
+import requests
 import urllib3
 
-from src.apps.Jenkins.Infrastructure.ServerJenkinsRepository import ServerJenkinsRepository
-from src.apps.Jenkins.Application.Build.JobBuilder import JobBuilder
-from src.apps.Jenkins.Application.Find.BuildFinder import BuildFinder
-from src.apps.Jenkins.Domain.JobParams import JobParams
+# Arguments
+optional_arg = lambda argv, index, default: default if (len(argv) <= index or argv == "") else argv[index]
+if len(sys.argv) < 4:
+    raise ValueError("Required fields: jenkins url, jenkins api token, jenkins username and jenkins job")
 
+JENKINS_URL = sys.argv[1]
+JENKINS_TOKEN = sys.argv[2]
+JENKINS_USERNAME = sys.argv[3]
+JENKINS_JOB_NAME = sys.argv[4]
+JENKINS_JOB_PARAMS = optional_arg(sys.argv, 5, '{}')
+JENKINS_WAIT_JOB = optional_arg(sys.argv, 6, "wait")
+JENKINS_SSL_VERIFY = optional_arg(sys.argv, 7, True)
 
-def mandatory_arg(argv):
-    if argv == "":
-        raise ValueError("Required fields: jenkins url, jenkins api token, jenkins username and jenkins job")
-    return argv
-
-
-JENKINS_URL = mandatory_arg(sys.argv[1])
-JENKINS_TOKEN = mandatory_arg(sys.argv[2])
-JENKINS_USERNAME = mandatory_arg(sys.argv[3])
-JENKINS_JOB_NAME = mandatory_arg(sys.argv[4])
-
-# Optional args
-JENKINS_JOB_PARAMS = sys.argv[5] if len(sys.argv) >= 5 else '{}'
-JENKINS_WAIT_JOB = sys.argv[6] if len(sys.argv) >= 6 else "wait"
-JENKINS_SSL_VERIFY = (sys.argv[7] == 'true') if len(sys.argv) >= 7 else true
-
-if not JENKINS_SSL_VERIFY:
+if JENKINS_SSL_VERIFY.lower() == 'false':
+    print("**Warning*** SSL certificate validation disabled by arguments!")
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Set Jenkins Connection
-repository = ServerJenkinsRepository(url=JENKINS_URL, token=JENKINS_TOKEN, username=JENKINS_USERNAME, ssl_verify=JENKINS_SSL_VERIFY)
+# Setup Jenkins Connection and start build
+connection = jenkins.Jenkins(JENKINS_URL, JENKINS_USERNAME, JENKINS_TOKEN)
+connection._session.verify = JENKINS_SSL_VERIFY
+queue_id = connection.build_job(JENKINS_JOB_NAME, parameters=json.loads(JENKINS_JOB_PARAMS), token=JENKINS_TOKEN)
+print(f"Build queued with queue_id: {queue_id}")
 
-# Build Job
-builder = JobBuilder(repository=repository)
-builder.exec(name=JENKINS_JOB_NAME, params=JobParams(JENKINS_JOB_PARAMS))
+# Wait for the build to start and store the build no
+protocol, domain = JENKINS_URL.split("://")
+build_number = None
+while True:
+    try: 
+        queue_info = requests.get(f"{protocol}://{JENKINS_USERNAME}:{JENKINS_TOKEN}@{domain}/queue/item/{queue_id}/api/json?pretty=true", verify=JENKINS_SSL_VERIFY).json()
+        build_number = queue_info["executable"]["number"]
+        break
+    except KeyError:
+        # todo: sometimes executable is in queue_info, but
+        # number is not, why?
+        if "executable" in queue_info:
+            print(queue_info["executable"])
+        time.sleep(3)
 
-# Get build number
-finder = BuildFinder(repository=repository, name=JENKINS_JOB_NAME)
-build_number = finder.number()
-print(f"BUILD NUMBER: {build_number}")
+if build_number is None:
+    raise Exception("Build could not be started")
 
+print(f"Build started with build_number: {build_number}")
+print(f"::set-output name=job_build_number::{build_number}")
+
+# early exit?
 if JENKINS_WAIT_JOB == "no-wait" and build_number:
-    print("Job status is : EXECUTED")
+    print(f"Build completed with status: EXECUTED")    
     print("::set-output name=job_status::EXECUTED")
     exit(0)
 
-# Get build status
-while not (status := finder.exec(build_number)):
-    time.sleep(1)
+# Wait for the build to complete
+console_lines = 0
+build_info = None
+while True:
+    console = connection.get_build_console_output(JENKINS_JOB_NAME, build_number).splitlines()
+    for i in range(console_lines, len(console)):
+        print(console[i])
+    console_lines = len(console)
+    build_info = connection.get_build_info(JENKINS_JOB_NAME, number=build_number)
+    if (status := build_info["result"]):
+        break
 
-print(f"Job status is : {status}")
+    time.sleep(3)
+
+# Summary
+print(f"Build completed with status: {status}")
 print(f"::set-output name=job_status::{status}")
-print(f"::set-output name=job_build_number::{build_number}")
 
 if status != 'SUCCESS':
     exit(1)
